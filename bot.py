@@ -3,143 +3,171 @@ import logging
 import asyncio
 import threading
 import sys
-import random
 import time
+import tempfile
+import random
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
-    CallbackQueryHandler,
+    MessageHandler,
     ContextTypes,
     filters,
 )
+import openai
 
 # --- CONFIGURATION ---
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
 PORT = int(os.environ.get("PORT", 8080))
 
-if not TOKEN:
-    print("ERROR: TELEGRAM_BOT_TOKEN is not set in Environment Variables!")
+if not TOKEN or not OPENAI_API_KEY:
+    print("ERROR: BOT_TOKEN or OPENAI_API_KEY is not set!")
     sys.exit(1)
+
+# Initialize OpenAI
+client = openai.OpenAI(api_key=OPENAI_API_KEY)
 
 # Logging
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- GAME DATA ---
-FISH_TYPES = [
-    {"name": "🐟 Common Minnow", "rarity": "Common", "chance": 60, "points": 10},
-    {"name": "🐠 Tropical Clownfish", "rarity": "Uncommon", "chance": 25, "points": 25},
-    {"name": "🐡 Pufferfish", "rarity": "Rare", "chance": 10, "points": 75},
-    {"name": "🦈 Great White Shark", "rarity": "Legendary", "chance": 4, "points": 500},
-    {"name": "🐙 Giant Squid", "rarity": "Mythical", "chance": 1, "points": 2000},
+# --- GAME DATA (Famous Players) ---
+PLAYERS = [
+    {"name": "Lionel Messi", "image": "https://upload.wikimedia.org/wikipedia/commons/c/c1/Lionel_Messi_20180626.jpg"},
+    {"name": "Cristiano Ronaldo", "image": "https://upload.wikimedia.org/wikipedia/commons/8/8c/Cristiano_Ronaldo_2018.jpg"},
+    {"name": "Neymar", "image": "https://upload.wikimedia.org/wikipedia/commons/b/bc/Bra-Cr0_%287%29.jpg"},
+    {"name": "Kylian Mbappe", "image": "https://upload.wikimedia.org/wikipedia/commons/5/57/Kylian_Mbapp%C3%A9_2018.jpg"},
+    {"name": "Erling Haaland", "image": "https://upload.wikimedia.org/wikipedia/commons/0/07/Erling_Haaland_2023_%28cropped%29.jpg"},
+    {"name": "Zinedine Zidane", "image": "https://upload.wikimedia.org/wikipedia/commons/f/f3/Zinedine_Zidane_by_Tasnim_01.jpg"},
+    {"name": "Ronaldinho", "image": "https://upload.wikimedia.org/wikipedia/commons/e/e8/Ronaldinho_11feb2007.jpg"}
 ]
 
-# Simple in-memory storage (Resets on restart)
-user_data = {}
+# In-memory storage
+user_sessions = {}
 
-def get_user(user_id):
-    if user_id not in user_data:
-        user_data[user_id] = {
-            "score": 0,
-            "energy": 5,
-            "last_regen": time.time(),
-            "total_caught": 0
+def get_session(user_id):
+    if user_id not in user_sessions:
+        user_sessions[user_id] = {
+            "battery_end": 0,
+            "attempts": 0,
+            "current_player": None,
+            "state": "IDLE"
         }
-    
-    # Regenerate energy: 1 energy every 10 minutes
-    user = user_data[user_id]
-    now = time.time()
-    elapsed = now - user["last_regen"]
-    regen_amount = int(elapsed // 600)
-    
-    if regen_amount > 0:
-        user["energy"] = min(5, user["energy"] + regen_amount)
-        user["last_regen"] = now
-        
-    return user
+    return user_sessions[user_id]
+
+def get_masked_name(name):
+    """Creates a hint like L_____ M____"""
+    parts = name.split()
+    masked_parts = []
+    for part in parts:
+        masked_parts.append(part[0] + "_" * (len(part) - 1))
+    return " ".join(masked_parts)
 
 # --- BOT LOGIC ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = get_user(update.effective_user.id)
-    text = (
-        "🎣 *WELCOME TO FISH DASH* 🌊\n\n"
-        "Cast your line and catch rare sea creatures!\n\n"
-        f"🎒 *Your Stats:*\n"
-        f"✨ Score: {user['score']}\n"
-        f"🐟 Caught: {user['total_caught']}\n"
-        f"⚡ Energy: {user['energy']}/5\n\n"
-        "Use /fish to start catching!"
+    await update.message.reply_text(
+        "⚽ *Football Star Challenge* ⚽\n\n"
+        "1. I show a player and a name hint.\n"
+        "2. You **Type** the full name.\n"
+        "3. You **Speak** the name to win!\n\n"
+        "⚠️ *Rules:*\n"
+        "• 2 chances per player.\n"
+        "• 2-hour recharge if you fail.\n\n"
+        "Type /play to start!"
     )
-    await update.message.reply_text(text, parse_mode='Markdown')
 
-async def fish_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def play(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    user = get_user(user_id)
+    session = get_session(user_id)
 
-    if user["energy"] <= 0:
-        await update.message.reply_text("🪫 *Out of Energy!*\nWait for your energy to refill (1 per 10 mins).", parse_mode='Markdown')
+    if time.time() < session["battery_end"]:
+        remaining = int((session["battery_end"] - time.time()) // 60)
+        return await update.message.reply_text(f"🪫 *Battery Low!* Recharging... {remaining} mins left.")
+
+    player = random.choice(PLAYERS)
+    session["current_player"] = player
+    session["attempts"] = 0
+    session["state"] = "WAITING_TEXT"
+
+    hint = get_masked_name(player["name"])
+    await update.message.reply_photo(
+        photo=player["image"],
+        caption=f"Guess this legend!\n\nHint: `{hint}`\n\n⌨️ *Type the full name:*",
+        parse_mode='Markdown'
+    )
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    session = get_session(user_id)
+
+    if session["state"] != "WAITING_TEXT":
         return
 
-    user["energy"] -= 1
-    
-    # Handle both message command and button callback
-    if update.message:
-        status_msg = await update.message.reply_text("🎣 Casting line... 🌊")
+    user_guess = update.message.text.lower().strip()
+    correct_name = session["current_player"]["name"].lower()
+
+    if correct_name in user_guess:
+        session["state"] = "WAITING_VOICE"
+        await update.message.reply_text(
+            f"🎯 *Great!* Now send a **Voice Note** saying '{session['current_player']['name']}' to confirm!",
+            parse_mode='Markdown'
+        )
     else:
-        status_msg = await update.callback_query.edit_message_text("🎣 Casting line... 🌊")
+        session["attempts"] += 1
+        if session["attempts"] < 2:
+            await update.message.reply_text("❌ *Wrong name!* Try one more time... ⌨️")
+        else:
+            session["battery_end"] = time.time() + 7200
+            session["state"] = "IDLE"
+            await update.message.reply_text(f"❌ *Failed!* It was {session['current_player']['name']}. 🪫 Battery empty. Wait 2 hours.")
+
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    session = get_session(user_id)
+
+    if session["state"] != "WAITING_VOICE":
+        return
+
+    status_msg = await update.message.reply_text("👂 Listening...")
+
+    try:
+        file = await context.bot.get_file(update.message.voice.file_id)
+        with tempfile.NamedTemporaryFile(suffix='.ogg', delete=False) as tf:
+            temp_path = tf.name
+            await file.download_to_drive(temp_path)
+
+        with open(temp_path, "rb") as audio_file:
+            transcript = client.audio.transcriptions.create(model="whisper-1", file=audio_file)
         
-    await asyncio.sleep(2) # Visual suspense
+        voice_guess = transcript.text.lower().strip()
+        correct_name = session["current_player"]["name"].lower()
+        os.remove(temp_path)
 
-    # Determine catch
-    roll = random.randint(1, 100)
-    cumulative = 0
-    caught_fish = None
+        if any(word in voice_guess for word in correct_name.split()):
+            await status_msg.edit_text(f"✅ *FANTASTIC!* You got {session['current_player']['name']}! 🎉\n/play again?")
+            session["state"] = "IDLE"
+        else:
+            session["attempts"] += 1
+            if session["attempts"] < 2:
+                await status_msg.edit_text("❌ *I couldn't hear that correctly.* One more chance! 🎙️")
+            else:
+                session["battery_end"] = time.time() + 7200
+                session["state"] = "IDLE"
+                await status_msg.edit_text(f"❌ *Voice failed!* Battery exhausted. Wait 2 hours.")
 
-    for fish in sorted(FISH_TYPES, key=lambda x: x['chance']):
-        cumulative += fish['chance']
-        if roll <= cumulative:
-            caught_fish = fish
-            break
-    
-    if not caught_fish: # Fallback to common
-        caught_fish = FISH_TYPES[0]
-
-    user["score"] += caught_fish["points"]
-    user["total_caught"] += 1
-
-    result_text = (
-        f"🎈 *YOU CAUGHT SOMETHING!* 🎈\n\n"
-        f"Type: {caught_fish['name']}\n"
-        f"Rarity: *{caught_fish['rarity']}*\n"
-        f"Points: +{caught_fish['points']}\n\n"
-        f"⚡ Energy Left: {user['energy']}/5\n"
-        f"💰 Total Score: {user['score']}"
-    )
-
-    keyboard = [[InlineKeyboardButton("Fish Again! 🎣", callback_data="play_again")]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    if update.message:
-        await status_msg.edit_text(result_text, reply_markup=reply_markup, parse_mode='Markdown')
-    else:
-        await update.callback_query.edit_message_text(result_text, reply_markup=reply_markup, parse_mode='Markdown')
-
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    
-    if query.data == "play_again":
-        await fish_command(update, context)
+    except Exception as e:
+        logger.error(f"Voice Error: {e}")
+        await status_msg.edit_text("⚠️ Error. Try again!")
 
 # --- RENDER HEALTH CHECK ---
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Fish Bot is running")
+        self.wfile.write(b"Football Legend Bot Active")
     def log_message(self, format, *args): return
 
 def run_health_check():
@@ -148,29 +176,19 @@ def run_health_check():
 
 async def main():
     threading.Thread(target=run_health_check, daemon=True).start()
+    app = ApplicationBuilder().token(TOKEN).build()
     
-    application = ApplicationBuilder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("play", play))
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
+    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     
-    # Handlers
-    application.add_handler(CommandHandler('start', start))
-    application.add_handler(CommandHandler('fish', fish_command))
-    application.add_handler(CallbackQueryHandler(button_handler))
-    
-    async with application:
-        await application.initialize()
-        await application.start()
-        
-        # Ensure no conflict
-        await application.bot.delete_webhook(drop_pending_updates=True)
-        
-        logger.info("Fish Catching Bot Started!")
-        await application.updater.start_polling(drop_pending_updates=True)
-        
-        while True:
-            await asyncio.sleep(1)
+    async with app:
+        await app.initialize()
+        await app.start()
+        await app.bot.delete_webhook(drop_pending_updates=True)
+        await app.updater.start_polling(drop_pending_updates=True)
+        while True: await asyncio.sleep(1)
 
 if __name__ == '__main__':
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        pass
+    asyncio.run(main())
