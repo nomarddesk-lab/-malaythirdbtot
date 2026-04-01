@@ -108,8 +108,14 @@ async def main():
     async with application:
         await application.initialize()
         await application.start()
+        
+        # FIX: Ensure no other webhooks are active and drop old updates to resolve Conflict errors
+        await application.bot.delete_webhook(drop_pending_updates=True)
+        
         logger.info("Music Bot Started!")
-        await application.updater.start_polling()
+        # Added drop_pending_updates here as well for extra safety
+        await application.updater.start_polling(drop_pending_updates=True)
+        
         while True: await asyncio.sleep(1)
 
 if __name__ == '__main__':
