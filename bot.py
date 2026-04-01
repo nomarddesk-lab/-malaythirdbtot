@@ -3,10 +3,9 @@ import logging
 import asyncio
 import threading
 import sys
-import yt_dlp
 import tempfile
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -14,109 +13,107 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
+import openai
 
 # --- CONFIGURATION ---
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
 PORT = int(os.environ.get("PORT", 8080))
 
 if not TOKEN:
-    print("ERROR: TELEGRAM_BOT_TOKEN is not set in Environment Variables!")
+    print("ERROR: TELEGRAM_BOT_TOKEN is not set!")
     sys.exit(1)
+
+# Initialize OpenAI client
+client = openai.OpenAI(api_key=OPENAI_API_KEY)
 
 # Logging
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- MUSIC SEARCH LOGIC ---
-def search_and_download(query):
-    # Use a unique temporary filename to avoid conflicts
-    temp_dir = tempfile.gettempdir()
-    file_path = os.path.join(temp_dir, "song.mp3")
-    
-    ydl_opts = {
-        'format': 'bestaudio/best',
-        'outtmpl': os.path.join(temp_dir, 'song.%(ext)s'),
-        'noplaylist': True,
-        'postprocessors': [{
-            'key': 'FFmpegExtractAudio',
-            'preferredcodec': 'mp3',
-            'preferredquality': '192',
-        }],
-        'default_search': 'ytsearch1',
-        'quiet': False,
-    }
-    
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(query, download=True)
-        video_title = info['entries'][0]['title'] if 'entries' in info else info.get('title', 'Music')
-        # yt-dlp might change extension to .mp3 after post-processing
-        actual_file = os.path.join(temp_dir, "song.mp3")
-        return actual_file, video_title
-
 # --- BOT LOGIC ---
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🎵 *AI Music Assistant* 🎵\n\n"
-        "Send me a song name or artist, and I'll find it for you!\n"
-        "Example: `Blinding Lights Weeknd`",
-        parse_mode='Markdown'
-    )
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_query = update.message.text
-    status_msg = await update.message.reply_text(f"🔍 Searching for: {user_query}...")
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "🎙️ *Welcome to AudioGen AI* 🎙️\n\n"
+        "I can turn your text into professional audio/music narration.\n\n"
+        "✨ *How to use:*\n"
+        "Just send me any text, and I will generate a high-quality audio file for you using AI."
+    )
+    await update.message.reply_text(text, parse_mode='Markdown')
+
+async def handle_text_to_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_text = update.message.text
+    
+    if len(user_text) > 500:
+        return await update.message.reply_text("⚠️ Text is too long! Please keep it under 500 characters.")
+
+    status_msg = await update.message.reply_text("🔊 *Generating your audio...* Please wait.", parse_mode='Markdown')
 
     try:
-        loop = asyncio.get_event_loop()
-        file_path, title = await loop.run_in_executor(None, search_and_download, user_query)
-        
-        await status_msg.edit_text(f"📥 Found: {title}\nUploading to Telegram...")
-        
-        with open(file_path, 'rb') as audio:
-            await update.message.reply_audio(
-                audio=audio, 
-                title=title,
-                caption=f"Enjoy! 🎧"
-            )
-            
-        if os.path.exists(file_path):
-            os.remove(file_path)
+        # Use OpenAI TTS-1 model for high-quality audio generation
+        # You can change voice to 'alloy', 'echo', 'fable', 'onyx', 'nova', or 'shimmer'
+        response = client.audio.speech.create(
+            model="tts-1",
+            voice="onyx", 
+            input=user_text
+        )
+
+        # Save to a temporary file
+        with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as tf:
+            temp_path = tf.name
+            response.stream_to_file(temp_path)
+
+        # Send the audio file to the user
+        await update.message.reply_audio(
+            audio=open(temp_path, 'rb'),
+            title="Generated Audio",
+            caption="Here is your AI-generated audio! 🎧"
+        )
+
+        # Cleanup
+        os.remove(temp_path)
         await status_msg.delete()
 
     except Exception as e:
-        logger.error(f"Bot Error: {e}")
-        await status_msg.edit_text("❌ Sorry, I couldn't process that music. Check Render logs for details.")
+        logger.error(f"Audio Generation Error: {e}")
+        await status_msg.edit_text("❌ Sorry, I failed to generate audio. Make sure your OpenAI API Key is valid and has credits.")
 
 # --- RENDER HEALTH CHECK ---
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bot is running")
+        self.wfile.write(b"Audio Bot is running")
     def log_message(self, format, *args): return
 
 def run_health_check():
     httpd = HTTPServer(('0.0.0.0', PORT), HealthCheckHandler)
     httpd.serve_forever()
 
+# --- MAIN ---
 async def main():
+    # Start health check thread
     threading.Thread(target=run_health_check, daemon=True).start()
+    
     application = ApplicationBuilder().token(TOKEN).build()
+
+    # Handlers
     application.add_handler(CommandHandler('start', start))
-    application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
+    application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text_to_audio))
     
     async with application:
         await application.initialize()
         await application.start()
         
-        # FIX: Ensure no other webhooks are active and drop old updates to resolve Conflict errors
+        # Clear conflicts
         await application.bot.delete_webhook(drop_pending_updates=True)
         
-        logger.info("Music Bot Started!")
-        # Added drop_pending_updates here as well for extra safety
+        logger.info("AudioGen Bot Started!")
         await application.updater.start_polling(drop_pending_updates=True)
         
-        while True: await asyncio.sleep(1)
+        while True:
+            await asyncio.sleep(1)
 
 if __name__ == '__main__':
     try:
